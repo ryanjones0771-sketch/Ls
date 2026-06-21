@@ -1,0 +1,1366 @@
+#!/usr/bin/env python3
+"""
+R☉LEX BOT – Full bot with owner/admin, cloning, all‑group spam/NC,
+Premium emoji, pic spam, DP change, /note, /target,
+/allstop, /reset, /restart, /status, /delay, /ping, /bots,
+Group Management (main bot only),
++ Welcome / Goodbye,
++ AI Chat Mode (OpenAI compatible).
+"""
+
+import asyncio
+import json
+import logging
+import os
+import subprocess
+import sys
+import time
+import aiohttp
+import telegram
+from telegram import Update, ReactionTypeEmoji, ChatPermissions
+from telegram.error import RetryAfter, TelegramError
+from telegram.ext import Application, MessageHandler, filters, ContextTypes
+
+# ========== CONFIG (CHANGE THESE) ==========
+OWNER_ID = 8581502899                     # Apna Telegram user ID
+DEFAULT_TOKEN = "8976006435:AAFuPURRHDl1WEDZXbHzQ1XLfuAu_bBQLTI"   # Main bot token
+BOT_ORIGINAL_NAME = "R☉LEX BOT"
+# =========================================
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# ---------- GLOBALS ----------
+spam_tasks: dict[int, asyncio.Task] = {}
+reply_tasks: dict[int, asyncio.Task] = {}
+pic_spam_tasks: dict[int, asyncio.Task] = {}
+dp_change_tasks: dict[int, asyncio.Task] = {}
+nc_task: asyncio.Task | None = None          # name change task
+restart_requested: bool = False              # for safe restart
+data_lock = asyncio.Lock()
+
+# ---------- DATA FILE ----------
+def get_data_file(token: str) -> str:
+    safe = "".join(c for c in token if c.isalnum())[:10]
+    return f"owner_data_{safe}.json"
+
+def default_data() -> dict:
+    return {
+        "owner_id": OWNER_ID,
+        "admins": [],
+        "prefix": "/",
+        "chats": {},
+        "known_groups": [],
+        "premium_emoji_id": None,
+        "message_delay": 0,
+        "clone_tokens": [],
+        # AI
+        "api_key": None,
+        "api_url": "https://api.openai.com/v1",
+        "ai_model": "gpt-3.5-turbo",
+        "system_prompt": "You are a helpful assistant.",
+        "conversations": {},
+    }
+
+async def load_data(token: str) -> dict:
+    data_file = get_data_file(token)
+    if not os.path.exists(data_file):
+        with open(data_file, "w") as f:
+            json.dump(default_data(), f, indent=4)
+        return default_data()
+    with open(data_file, "r") as f:
+        return json.load(f)
+
+async def save_data(data: dict, token: str):
+    async with data_lock:
+        with open(get_data_file(token), "w") as f:
+            json.dump(data, f, indent=4)
+
+# ---------- PERMISSIONS ----------
+def is_owner(user_id: int, data: dict) -> bool:
+    return user_id == data["owner_id"]
+
+def is_admin(user_id: int, data: dict) -> bool:
+    return user_id == data["owner_id"] or user_id in data["admins"]
+
+# ---------- SAFE SEND / REACT ----------
+async def safe_send(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str,
+                    parse_mode=None, **kwargs):
+    while True:
+        try:
+            return await context.bot.send_message(
+                chat_id=chat_id, text=text,
+                parse_mode=parse_mode, **kwargs
+            )
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+        except TelegramError as e:
+            logger.error(f"Send error in chat {chat_id}: {e}")
+            break
+
+async def safe_send_photo(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
+                          photo: str, caption: str = None, **kwargs):
+    while True:
+        try:
+            return await context.bot.send_photo(
+                chat_id=chat_id, photo=photo,
+                caption=caption, **kwargs
+            )
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+        except TelegramError as e:
+            logger.error(f"Photo send error in chat {chat_id}: {e}")
+            break
+
+async def safe_set_chat_photo(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
+                               photo: str):
+    while True:
+        try:
+            await context.bot.set_chat_photo(chat_id=chat_id, photo=photo)
+            return
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+        except TelegramError as e:
+            logger.error(f"Set chat photo error in {chat_id}: {e}")
+            break
+
+async def safe_react(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
+                     message_id: int, emoji: str):
+    while True:
+        try:
+            await context.bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=message_id,
+                reaction=[ReactionTypeEmoji(emoji=emoji)],
+            )
+            return
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+        except TelegramError:
+            break
+
+# ---------- PREMIUM EMOJI FORMAT ----------
+def format_with_premium(text: str, premium_id: str | None) -> str:
+    if premium_id:
+        return f'<tg-emoji emoji-id="{premium_id}"></tg-emoji> {text}'
+    return text
+
+# ---------- LOOPS ----------
+async def spam_loop(chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE,
+                    premium_id: str | None):
+    message = format_with_premium(text, premium_id)
+    while True:
+        await safe_send(context, chat_id, message,
+                        parse_mode="HTML" if premium_id else None)
+        delay = context.bot_data.get("persistent_data", {}).get("message_delay", 0)
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+async def reply_loop(chat_id: int, text: str, reply_to_msg_id: int,
+                     context: ContextTypes.DEFAULT_TYPE, premium_id: str | None):
+    message = format_with_premium(text, premium_id)
+    while True:
+        await safe_send(context, chat_id, message,
+                        reply_to_message_id=reply_to_msg_id,
+                        parse_mode="HTML" if premium_id else None)
+        delay = context.bot_data.get("persistent_data", {}).get("message_delay", 0)
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+async def pic_spam_loop(chat_id: int, file_id: str,
+                        context: ContextTypes.DEFAULT_TYPE):
+    while True:
+        await safe_send_photo(context, chat_id, file_id)
+        delay = context.bot_data.get("persistent_data", {}).get("message_delay", 0)
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+async def dp_change_loop(chat_id: int, file_id: str,
+                         context: ContextTypes.DEFAULT_TYPE):
+    while True:
+        await safe_set_chat_photo(context, chat_id, file_id)
+        await asyncio.sleep(2)
+
+async def name_change_loop(app: Application):
+    heart_name = BOT_ORIGINAL_NAME + "❤️"
+    while True:
+        try:
+            await app.bot.set_my_name(heart_name)
+            await asyncio.sleep(1)
+            await app.bot.set_my_name(BOT_ORIGINAL_NAME)
+            await asyncio.sleep(1)
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+        except TelegramError:
+            break
+
+# ---------- HELPERS ----------
+def get_chat_data(data: dict, chat_id: int) -> dict:
+    key = str(chat_id)
+    if key not in data["chats"]:
+        data["chats"][key] = {
+            "global_react": False,
+            "react_emoji": "❤️",
+            "user_reacts": [],
+            "notes": {},
+            "auto_replies": {},
+            "welcome_enabled": False,
+            "welcome_text": None,
+            "goodbye_enabled": False,
+            "goodbye_text": None,
+        }
+    return data["chats"][key]
+
+async def resolve_user_id(context: ContextTypes.DEFAULT_TYPE, arg: str) -> int | None:
+    if arg.isdigit():
+        return int(arg)
+    if arg.startswith("@"):
+        try:
+            user = await context.bot.get_chat(arg)
+            return user.id
+        except TelegramError:
+            return None
+    try:
+        user = await context.bot.get_chat(f"@{arg}")
+        return user.id
+    except TelegramError:
+        return None
+
+def is_group_chat(update: Update) -> bool:
+    chat = update.effective_chat
+    return chat is not None and chat.type in ("group", "supergroup")
+
+# ---------- AI CHAT HANDLER ----------
+async def chat_with_ai(context: ContextTypes.DEFAULT_TYPE, data: dict, token: str,
+                       chat_id: int, user_message: str) -> str:
+    api_key = data.get("api_key")
+    api_url = data.get("api_url", "https://api.openai.com/v1")
+    model = data.get("ai_model", "gpt-3.5-turbo")
+    system_prompt = data.get("system_prompt", "You are a helpful assistant.")
+
+    if not api_key:
+        return "❌ API key not set. Use /setapikey."
+
+    conv_key = str(chat_id)
+    history = data.setdefault("conversations", {}).get(conv_key, [])
+    if not history:
+        history = [{"role": "system", "content": system_prompt}]
+        data["conversations"][conv_key] = history
+
+    history.append({"role": "user", "content": user_message})
+
+    # Keep last 20 non‑system messages + system
+    system_msgs = [m for m in history if m["role"] == "system"]
+    non_system = [m for m in history if m["role"] != "system"][-20:]
+    history = system_msgs + non_system
+    data["conversations"][conv_key] = history
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model,
+        "messages": history,
+        "temperature": 0.7,
+    }
+
+    session = context.bot_data.get("http_session")
+    if not session:
+        session = aiohttp.ClientSession()
+        context.bot_data["http_session"] = session
+
+    try:
+        async with session.post(f"{api_url}/chat/completions", json=payload,
+                                headers=headers) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                logger.error(f"AI API error: {resp.status} {error_text}")
+                return f"❌ API error: {resp.status}"
+            result = await resp.json()
+            assistant_msg = result["choices"][0]["message"]["content"]
+            history.append({"role": "assistant", "content": assistant_msg})
+            data["conversations"][conv_key] = history
+            await save_data(data, token)
+            return assistant_msg
+    except Exception as e:
+        logger.error(f"AI request failed: {e}")
+        return f"❌ AI request failed: {e}"
+
+# ---------- WELCOME / GOODBYE HANDLERS ----------
+async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.bot_data.get("persistent_data")
+    if not data:
+        return
+    chat = update.effective_chat
+    if not chat or chat.type not in ("group", "supergroup"):
+        return
+    chat_data = data["chats"].get(str(chat.id))
+    if not chat_data or not chat_data.get("welcome_enabled"):
+        return
+
+    welcome_text = chat_data.get("welcome_text", "Welcome {user} to {group}! 🎉")
+    for member in update.message.new_chat_members:
+        user = member
+        user_mention = f"[{user.first_name}](tg://user?id={user.id})"
+        group_title = chat.title
+        username = f"@{user.username}" if user.username else "no username"
+        text = welcome_text.format(user=user_mention, group=group_title,
+                                   username=username, userid=user.id)
+
+        try:
+            photos = await context.bot.get_user_profile_photos(user.id, limit=1)
+            if photos.photos:
+                file_id = photos.photos[0][0].file_id
+                await safe_send_photo(context, chat.id, file_id, caption=text, parse_mode="Markdown")
+            else:
+                await safe_send(context, chat.id, text, parse_mode="Markdown")
+        except Exception:
+            await safe_send(context, chat.id, text, parse_mode="Markdown")
+
+async def goodbye_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = context.bot_data.get("persistent_data")
+    if not data:
+        return
+    chat = update.effective_chat
+    if not chat or chat.type not in ("group", "supergroup"):
+        return
+    chat_data = data["chats"].get(str(chat.id))
+    if not chat_data or not chat_data.get("goodbye_enabled"):
+        return
+
+    goodbye_text = chat_data.get("goodbye_text", "Goodbye {user}! 👋")
+    left_user = update.message.left_chat_member
+    user_mention = f"[{left_user.first_name}](tg://user?id={left_user.id})"
+    group_title = chat.title
+    username = f"@{left_user.username}" if left_user.username else "no username"
+    text = goodbye_text.format(user=user_mention, group=group_title,
+                               username=username, userid=left_user.id)
+    await safe_send(context, chat.id, text, parse_mode="Markdown")
+
+# ---------- MAIN HANDLER ----------
+async def handle_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global nc_task, restart_requested
+
+    data = context.bot_data.get("persistent_data")
+    token = context.bot_data.get("bot_token")
+    is_main = not context.bot_data.get("is_clone", False)
+    if data is None or token is None:
+        return
+
+    # Track groups for /allgcspam
+    if is_group_chat(update):
+        chat_id = update.effective_chat.id
+        if chat_id not in data["known_groups"]:
+            data["known_groups"].append(chat_id)
+            await save_data(data, token)
+
+    msg = update.message or update.edited_message
+    if not msg:
+        return
+
+    text = msg.text.strip() if msg.text else ""
+    prefix = data.get("prefix", "/")
+
+    if text.startswith(prefix):
+        command_part = text[len(prefix):].strip()
+        if not command_part:
+            return
+        cmd, *args = command_part.split()
+        cmd = cmd.lower()
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+
+        # ---------- PUBLIC COMMANDS ----------
+        if cmd == "start":
+            await msg.reply_text(f"R☉LEX BOT ready! Owner: R☉LEX SIR\nPrefix: {prefix}")
+            return
+
+        if cmd == "help":
+            help_text = (
+                "**R☉LEX BOT**\n"
+                f"Prefix: `{prefix}`\n\n"
+                "**Admin commands:**\n"
+                f"{prefix}spam <text> – spam text\n"
+                f"{prefix}allgcspam <text> – spam in all groups\n"
+                f"{prefix}reply <text> (reply) – non‑stop reply\n"
+                f"{prefix}spampic (reply to photo) – photo spam\n"
+                f"{prefix}changegroupdp (reply to photo) – change group DP repeatedly\n"
+                f"{prefix}react (@user or reply) – toggle auto‑react\n"
+                f"{prefix}globalreact – toggle react on every message\n"
+                f"{prefix}changereacremoji <emoji> – change react emoji\n"
+                f"{prefix}nc / allgcnc – toggle global name change\n"
+                f"{prefix}addbot <token> – clone this bot\n"
+                f"{prefix}stop – stop all loops in this chat\n"
+                f"{prefix}allstop – stop all loops in EVERY chat\n\n"
+                "**Note & Target:**\n"
+                f"{prefix}note <name> (reply) – save note\n"
+                f"{prefix}notes – list notes\n"
+                f"{prefix}getnote <name> – retrieve note\n"
+                f"{prefix}deln <name> – delete note\n"
+                f"{prefix}target @username <text> – auto‑reply to user\n"
+                f"{prefix}target off (reply) – disable auto‑reply\n\n"
+                "**Other:**\n"
+                f"{prefix}ping – show bot latency\n"
+                f"{prefix}status – show running tasks\n"
+                f"{prefix}delay [seconds] – get/set message delay\n\n"
+                "**Group Management (main bot only, admin):**\n"
+                f"{prefix}mute (reply/@user) – mute user\n"
+                f"{prefix}unmute (reply/@user) – unmute user\n"
+                f"{prefix}kick (reply/@user) – kick user\n"
+                f"{prefix}ban (reply/@user) – ban user\n"
+                f"{prefix}unban (reply/@user) – unban user\n"
+                f"{prefix}promote (reply/@user) [title] – promote to admin\n"
+                f"{prefix}demote (reply/@user) – remove admin\n"
+                f"{prefix}title (reply/@user) <title> – set admin title\n"
+                f"{prefix}setgrouptitle <title> – change group title\n"
+                f"{prefix}setgroupdesc <desc> – change group description\n"
+                f"{prefix}setgroupphoto (reply to photo) – set group photo\n"
+                f"{prefix}delete (reply) – delete a message\n"
+                f"{prefix}pin (reply) – pin message\n"
+                f"{prefix}unpin (reply) – unpin; {prefix}unpin all – unpin all\n"
+                f"{prefix}invite – generate invite link\n\n"
+                "**Welcome & Goodbye:**\n"
+                f"{prefix}welcome <message> – set welcome message (placeholders: {{user}}, {{group}}, {{username}}, {{userid}})\n"
+                f"{prefix}welcome off – disable welcome\n"
+                f"{prefix}goodbye <message> – set goodbye message\n"
+                f"{prefix}goodbye off – disable goodbye\n\n"
+                "**AI Chat:**\n"
+                f"{prefix}chat <message> – talk to AI\n"
+                f"{prefix}resetai – clear conversation history\n"
+                f"{prefix}systemprompt <text> – set AI's behaviour\n"
+                f"{prefix}aistatus – show AI settings\n"
+                f"{prefix}setapikey <key> – (owner) set OpenAI API key\n"
+                f"{prefix}setapiurl <url> – (owner) set API URL\n"
+                f"{prefix}setmodel <model> – (owner) set AI model\n\n"
+                "**Owner commands:**\n"
+                f"{prefix}setprefix <new> – change prefix\n"
+                f"{prefix}addadmin <id/username> – add admin\n"
+                f"{prefix}removeadmin <id/username> – remove admin\n"
+                f"{prefix}admins – list admins\n"
+                f"{prefix}setpremiumemoji <id> – set premium emoji\n"
+                f"{prefix}reset – reset bot (keep owner & prefix)\n"
+                f"{prefix}restart – restart the bot\n"
+                f"{prefix}bots – list all bots with ping"
+            )
+            await msg.reply_text(help_text, parse_mode="Markdown")
+            return
+
+        # ---------- PUBLIC UTILITY ----------
+        if cmd == "ping":
+            start = time.time()
+            try:
+                await context.bot.get_me()
+                latency = (time.time() - start) * 1000
+                await msg.reply_text(f"🏓 Pong! `{latency:.2f} ms`", parse_mode="Markdown")
+            except Exception as e:
+                await msg.reply_text(f"❌ Ping failed: {e}")
+            return
+
+        if cmd == "status":
+            lines = []
+
+            if spam_tasks:
+                lines.append("**🔄 Spam loops:**")
+                for cid, task in spam_tasks.items():
+                    status = "🟢" if not task.done() else "🔴"
+                    lines.append(f"  {status} Chat `{cid}`")
+            else:
+                lines.append("**🔄 Spam loops:** None")
+
+            if reply_tasks:
+                lines.append("**💬 Reply loops:**")
+                for cid, task in reply_tasks.items():
+                    status = "🟢" if not task.done() else "🔴"
+                    lines.append(f"  {status} Chat `{cid}`")
+            else:
+                lines.append("**💬 Reply loops:** None")
+
+            if pic_spam_tasks:
+                lines.append("**🖼️ Pic spam:**")
+                for cid, task in pic_spam_tasks.items():
+                    status = "🟢" if not task.done() else "🔴"
+                    lines.append(f"  {status} Chat `{cid}`")
+            else:
+                lines.append("**🖼️ Pic spam:** None")
+
+            if dp_change_tasks:
+                lines.append("**👥 DP change:**")
+                for cid, task in dp_change_tasks.items():
+                    status = "🟢" if not task.done() else "🔴"
+                    lines.append(f"  {status} Chat `{cid}`")
+            else:
+                lines.append("**👥 DP change:** None")
+
+            if nc_task and not nc_task.done():
+                lines.append("**✨ Name change:** 🟢 Active")
+            else:
+                lines.append("**✨ Name change:** ❌ Inactive")
+
+            lines.append("\n**❤️ Auto‑react status:**")
+            for cid_str, chat_data in data.get("chats", {}).items():
+                cid = int(cid_str)
+                global_r = chat_data.get("global_react", False)
+                user_r = chat_data.get("user_reacts", [])
+                if global_r or user_r:
+                    parts = []
+                    if global_r:
+                        parts.append("Global ON")
+                    if user_r:
+                        parts.append(f"Users: {', '.join(str(u) for u in user_r)}")
+                    lines.append(f"  Chat `{cid}`: {' | '.join(parts)}")
+            if not any(c.get("global_react") or c.get("user_reacts") for c in data.get("chats", {}).values()):
+                lines.append("  No auto‑react active.")
+
+            delay = data.get("message_delay", 0)
+            lines.append(f"\n⏱️ **Message delay:** {delay} sec")
+
+            await msg.reply_text("\n".join(lines), parse_mode="Markdown")
+            return
+
+        # ---------- OWNER-ONLY ----------
+        if cmd in ("setprefix", "addadmin", "removeadmin", "admins",
+                   "setpremiumemoji", "reset", "restart", "bots",
+                   "setapikey", "setapiurl", "setmodel"):
+            if not is_owner(user_id, data):
+                await msg.reply_text("You are not allowed to do this. Contact @Divkylu for permission.")
+                return
+
+            if cmd == "setprefix":
+                if not args:
+                    await msg.reply_text(f"Usage: {prefix}setprefix <new_prefix>")
+                    return
+                data["prefix"] = args[0]
+                await save_data(data, token)
+                await msg.reply_text(f"Prefix changed to: {args[0]}")
+                return
+
+            elif cmd == "addadmin":
+                if not args:
+                    await msg.reply_text(f"Usage: {prefix}addadmin <id or @user>")
+                    return
+                target_id = await resolve_user_id(context, args[0])
+                if not target_id:
+                    await msg.reply_text("Could not resolve user.")
+                    return
+                if target_id in data["admins"] or target_id == data["owner_id"]:
+                    await msg.reply_text("Already admin/owner.")
+                    return
+                data["admins"].append(target_id)
+                await save_data(data, token)
+                await msg.reply_text(f"Added admin: {target_id}")
+                return
+
+            elif cmd == "removeadmin":
+                if not args:
+                    await msg.reply_text(f"Usage: {prefix}removeadmin <id or @user>")
+                    return
+                target_id = await resolve_user_id(context, args[0])
+                if not target_id:
+                    await msg.reply_text("Could not resolve user.")
+                    return
+                if target_id in data["admins"]:
+                    data["admins"].remove(target_id)
+                    await save_data(data, token)
+                    await msg.reply_text(f"Removed admin: {target_id}")
+                else:
+                    await msg.reply_text("Not an admin.")
+                return
+
+            elif cmd == "admins":
+                admins_list = [data["owner_id"]] + data["admins"]
+                text = "**Admins:**\n" + "\n".join(str(a) for a in admins_list)
+                await msg.reply_text(text, parse_mode="Markdown")
+                return
+
+            elif cmd == "setpremiumemoji":
+                if not args:
+                    await msg.reply_text(f"Usage: {prefix}setpremiumemoji <custom_emoji_id>")
+                    return
+                data["premium_emoji_id"] = args[0]
+                await save_data(data, token)
+                await msg.reply_text(f"Premium emoji set to `{args[0]}`.")
+                return
+
+            elif cmd == "reset":
+                old_owner = data["owner_id"]
+                old_prefix = data["prefix"]
+                new_data = default_data()
+                new_data["owner_id"] = old_owner
+                new_data["prefix"] = old_prefix
+                context.bot_data["persistent_data"] = new_data
+                await save_data(new_data, token)
+                await msg.reply_text("Bot has been reset (owner & prefix preserved).")
+                return
+
+            elif cmd == "restart":
+                await msg.reply_text("Restarting bot...")
+                restart_requested = True
+                await context.application.stop()
+                return
+
+            elif cmd == "bots":
+                all_tokens = [token] + data.get("clone_tokens", [])
+                lines = ["**🤖 Bots status:**\n"]
+                for i, tok in enumerate(all_tokens, 1):
+                    try:
+                        bot = telegram.Bot(tok)
+                        start = time.time()
+                        me = await bot.get_me()
+                        latency = (time.time() - start) * 1000
+                        if latency < 300:
+                            icon = "🟢"
+                        elif latency < 600:
+                            icon = "🟡"
+                        else:
+                            icon = "🔴"
+                        lines.append(f"{i}. @{me.username}   {icon} {latency:.0f} ms")
+                    except Exception as e:
+                        lines.append(f"{i}. Token `{tok[:6]}...`   ❌ Error: {str(e)[:50]}")
+                await msg.reply_text("\n".join(lines), parse_mode="Markdown")
+                return
+
+            elif cmd == "setapikey":
+                if not args:
+                    await msg.reply_text("Usage: /setapikey <your_api_key>")
+                    return
+                data["api_key"] = args[0]
+                await save_data(data, token)
+                await msg.reply_text("✅ API key set.")
+                return
+
+            elif cmd == "setapiurl":
+                if not args:
+                    await msg.reply_text("Usage: /setapiurl <api_base_url>")
+                    return
+                data["api_url"] = args[0].rstrip("/")
+                await save_data(data, token)
+                await msg.reply_text(f"✅ API URL set to {data['api_url']}")
+                return
+
+            elif cmd == "setmodel":
+                if not args:
+                    await msg.reply_text("Usage: /setmodel <model_name>")
+                    return
+                data["ai_model"] = args[0]
+                await save_data(data, token)
+                await msg.reply_text(f"✅ AI model set to {args[0]}")
+                return
+
+        # ---------- ADMIN-REQUIRED ----------
+        if not is_admin(user_id, data):
+            await msg.reply_text("You are not allowed to do this. Contact @Divkylu for permission.")
+            return
+
+        # ========== COMMANDS ==========
+        premium_id = data.get("premium_emoji_id")
+
+        # 1. SPAM
+        if cmd == "spam":
+            if not args:
+                await msg.reply_text(f"Usage: {prefix}spam <text>")
+                return
+            text_spam = " ".join(args)
+            if chat_id in spam_tasks and not spam_tasks[chat_id].done():
+                spam_tasks[chat_id].cancel()
+            task = asyncio.create_task(spam_loop(chat_id, text_spam, context, premium_id))
+            spam_tasks[chat_id] = task
+            await msg.reply_text(f"Spamming: {text_spam}")
+            return
+
+        # 2. ALL‑GROUP SPAM
+        elif cmd == "allgcspam":
+            if not args:
+                await msg.reply_text(f"Usage: {prefix}allgcspam <text>")
+                return
+            text_spam = " ".join(args)
+            known = data.get("known_groups", [])
+            if not known:
+                await msg.reply_text("No known groups.")
+                return
+            count = 0
+            for gid in known:
+                if gid in spam_tasks and not spam_tasks[gid].done():
+                    spam_tasks[gid].cancel()
+                task = asyncio.create_task(spam_loop(gid, text_spam, context, premium_id))
+                spam_tasks[gid] = task
+                count += 1
+            await msg.reply_text(f"🚀 Spamming in {count} group(s): {text_spam}")
+            return
+
+        # 3. REPLY
+        elif cmd == "reply":
+            if not msg.reply_to_message:
+                await msg.reply_text("Reply to a message.")
+                return
+            text_reply = " ".join(args) if args else "REPLY"
+            target_msg = msg.reply_to_message
+            if chat_id in reply_tasks and not reply_tasks[chat_id].done():
+                reply_tasks[chat_id].cancel()
+            task = asyncio.create_task(reply_loop(chat_id, text_reply,
+                                                  target_msg.message_id,
+                                                  context, premium_id))
+            reply_tasks[chat_id] = task
+            await msg.reply_text(f"Replying non‑stop to {target_msg.from_user.first_name}")
+            return
+
+        # 4. NAME CHANGE (global)
+        elif cmd in ("nc", "allgcnc"):
+            if nc_task and not nc_task.done():
+                nc_task.cancel()
+                nc_task = None
+                await msg.reply_text("Name change stopped.")
+            else:
+                nc_task = asyncio.create_task(name_change_loop(context.application))
+                await msg.reply_text("Global name change started (blinking ❤️)")
+            return
+
+        # 5. CLONE BOT
+        elif cmd == "addbot":
+            if not args:
+                await msg.reply_text(f"Usage: {prefix}addbot <new_bot_token>")
+                return
+            new_token = args[0]
+            if ":" not in new_token or len(new_token) < 20:
+                await msg.reply_text("Invalid bot token.")
+                return
+            try:
+                script_path = sys.argv[0] if sys.argv[0].endswith(".py") else "relex_bot.py"
+                subprocess.Popen([sys.executable, script_path, new_token])
+                data.setdefault("clone_tokens", []).append(new_token)
+                await save_data(data, token)
+                await msg.reply_text(f"✅ Clone launched: `{new_token[:6]}...`")
+            except Exception as e:
+                await msg.reply_text(f"❌ Failed: {e}")
+            return
+
+        # 6. STOP (local chat loops)
+        elif cmd == "stop":
+            cancelled = False
+            for tasks_dict in (spam_tasks, reply_tasks, pic_spam_tasks, dp_change_tasks):
+                task = tasks_dict.pop(chat_id, None)
+                if task and not task.done():
+                    task.cancel()
+                    cancelled = True
+            if cancelled:
+                await msg.reply_text("Stopped all loops in this chat.")
+            else:
+                await msg.reply_text("No active loops to stop.")
+            return
+
+        # 7. ALLSTOP (global stop)
+        elif cmd == "allstop":
+            cancelled = 0
+            for task_dict in (spam_tasks, reply_tasks, pic_spam_tasks, dp_change_tasks):
+                for chat_id_val, task in list(task_dict.items()):
+                    if not task.done():
+                        task.cancel()
+                        cancelled += 1
+                task_dict.clear()
+            if nc_task and not nc_task.done():
+                nc_task.cancel()
+                nc_task = None
+                cancelled += 1
+            await msg.reply_text(f"Stopped all loops everywhere ({cancelled} tasks).")
+            return
+
+        # 8. PHOTO SPAM
+        elif cmd == "spampic":
+            if not msg.reply_to_message or not msg.reply_to_message.photo:
+                await msg.reply_text("Reply to a photo with /spampic")
+                return
+            photo = msg.reply_to_message.photo[-1]
+            file_id = photo.file_id
+            if chat_id in pic_spam_tasks and not pic_spam_tasks[chat_id].done():
+                pic_spam_tasks[chat_id].cancel()
+            task = asyncio.create_task(pic_spam_loop(chat_id, file_id, context))
+            pic_spam_tasks[chat_id] = task
+            await msg.reply_text("Now spamming this photo.")
+            return
+
+        # 9. GROUP DP CHANGE
+        elif cmd == "changegroupdp":
+            if not msg.reply_to_message or not msg.reply_to_message.photo:
+                await msg.reply_text("Reply to a photo with /changegroupdp")
+                return
+            photo = msg.reply_to_message.photo[-1]
+            file_id = photo.file_id
+            if chat_id in dp_change_tasks and not dp_change_tasks[chat_id].done():
+                dp_change_tasks[chat_id].cancel()
+            task = asyncio.create_task(dp_change_loop(chat_id, file_id, context))
+            dp_change_tasks[chat_id] = task
+            await msg.reply_text("Now changing group DP repeatedly.")
+            return
+
+        # 10. REACT (per user)
+        elif cmd == "react":
+            target_user_id = None
+            if msg.reply_to_message:
+                target_user_id = msg.reply_to_message.from_user.id
+            elif args and args[0].startswith("@"):
+                target_user_id = await resolve_user_id(context, args[0])
+                if not target_user_id:
+                    await msg.reply_text("Could not find that user.")
+                    return
+            else:
+                await msg.reply_text("Reply to a user or use /react @username")
+                return
+
+            chat_data = get_chat_data(data, chat_id)
+            user_reacts = chat_data.setdefault("user_reacts", [])
+            emoji = chat_data.get("react_emoji", "❤️")
+
+            if target_user_id in user_reacts:
+                user_reacts.remove(target_user_id)
+                await save_data(data, token)
+                await msg.reply_text(f"❌ Stopped reacting to user {target_user_id}")
+            else:
+                user_reacts.append(target_user_id)
+                await save_data(data, token)
+                await msg.reply_text(f"✅ Now reacting to user {target_user_id} with {emoji}")
+            return
+
+        # 11. GLOBAL REACT
+        elif cmd == "globalreact":
+            chat_data = get_chat_data(data, chat_id)
+            chat_data["global_react"] = not chat_data.get("global_react", False)
+            await save_data(data, token)
+            status = "ON" if chat_data["global_react"] else "OFF"
+            emoji = chat_data.get("react_emoji", "❤️")
+            await msg.reply_text(f"Global react {status} (emoji: {emoji})")
+            return
+
+        # 12. CHANGE REACT EMOJI
+        elif cmd == "changereacremoji":
+            if not args:
+                await msg.reply_text(f"Usage: {prefix}changereacremoji <emoji>")
+                return
+            new_emoji = args[0]
+            chat_data = get_chat_data(data, chat_id)
+            chat_data["react_emoji"] = new_emoji
+            await save_data(data, token)
+            await msg.reply_text(f"React emoji changed to {new_emoji}")
+            return
+
+        # ---------- DELAY COMMAND ----------
+        elif cmd == "delay":
+            if not args:
+                current_delay = data.get("message_delay", 0)
+                await msg.reply_text(f"⏱️ Current message delay: `{current_delay}` sec\n"
+                                     f"Use `{prefix}delay <seconds>` to change.", parse_mode="Markdown")
+                return
+            try:
+                new_delay = float(args[0])
+                if new_delay < 0:
+                    await msg.reply_text("Delay cannot be negative.")
+                    return
+                data["message_delay"] = new_delay
+                await save_data(data, token)
+                await msg.reply_text(f"✅ Message delay set to `{new_delay}` sec.", parse_mode="Markdown")
+            except ValueError:
+                await msg.reply_text("Invalid number.")
+            return
+
+        # ---------- NOTE COMMANDS ----------
+        elif cmd == "note":
+            if len(args) < 1:
+                await msg.reply_text(f"Usage: {prefix}note <name> (reply to msg) or {prefix}note <name> <text>")
+                return
+            note_name = args[0].lower()
+            chat_data = get_chat_data(data, chat_id)
+            if note_name in ("notes", "getnote", "deln"):
+                await msg.reply_text("That name is reserved for a command.")
+                return
+            if msg.reply_to_message:
+                saved_text = msg.reply_to_message.text or msg.reply_to_message.caption or "No text"
+            else:
+                saved_text = " ".join(args[1:]) if len(args) > 1 else None
+                if not saved_text:
+                    await msg.reply_text("Please provide text after the name or reply to a message.")
+                    return
+            chat_data["notes"][note_name] = saved_text
+            await save_data(data, token)
+            await msg.reply_text(f"Note `{note_name}` saved.")
+            return
+
+        elif cmd == "notes":
+            chat_data = get_chat_data(data, chat_id)
+            note_names = list(chat_data.get("notes", {}).keys())
+            if not note_names:
+                await msg.reply_text("No notes in this chat.")
+            else:
+                await msg.reply_text("**Saved notes:**\n" + "\n".join(f"• `{n}`" for n in note_names),
+                                     parse_mode="Markdown")
+            return
+
+        elif cmd == "getnote":
+            if not args:
+                await msg.reply_text(f"Usage: {prefix}getnote <name>")
+                return
+            note_name = args[0].lower()
+            chat_data = get_chat_data(data, chat_id)
+            text = chat_data["notes"].get(note_name)
+            if text:
+                await msg.reply_text(text)
+            else:
+                await msg.reply_text("Note not found.")
+            return
+
+        elif cmd == "deln":
+            if not args:
+                await msg.reply_text(f"Usage: {prefix}deln <name>")
+                return
+            note_name = args[0].lower()
+            chat_data = get_chat_data(data, chat_id)
+            if note_name in chat_data["notes"]:
+                del chat_data["notes"][note_name]
+                await save_data(data, token)
+                await msg.reply_text(f"Note `{note_name}` deleted.")
+            else:
+                await msg.reply_text("Note not found.")
+            return
+
+        # ---------- TARGET AUTO‑REPLY ----------
+        elif cmd == "target":
+            chat_data = get_chat_data(data, chat_id)
+            auto_replies = chat_data.setdefault("auto_replies", {})
+
+            target_user_id = None
+            if msg.reply_to_message:
+                target_user_id = msg.reply_to_message.from_user.id
+            elif args and args[0].startswith("@"):
+                target_user_id = await resolve_user_id(context, args[0])
+                if not target_user_id:
+                    await msg.reply_text("Could not find user.")
+                    return
+                args = args[1:]   # remove the @username
+            else:
+                await msg.reply_text("Reply to a user's message or use /target @username")
+                return
+
+            if args and args[0].lower() == "off":
+                if str(target_user_id) in auto_replies:
+                    del auto_replies[str(target_user_id)]
+                    await save_data(data, token)
+                    await msg.reply_text(f"Auto‑reply disabled for user {target_user_id}.")
+                else:
+                    await msg.reply_text("No auto‑reply was set for that user.")
+                return
+
+            reply_text = " ".join(args) if args else "REPLY"
+            auto_replies[str(target_user_id)] = reply_text
+            await save_data(data, token)
+            await msg.reply_text(f"✅ Now auto‑replying to user {target_user_id} with: {reply_text}")
+            return
+
+        # ========== GROUP MANAGEMENT (MAIN BOT ONLY) ==========
+        if not is_main:
+            if cmd in ("mute", "unmute", "kick", "ban", "unban", "promote", "demote",
+                       "title", "setgrouptitle", "setgroupdesc", "setgroupphoto",
+                       "delete", "pin", "unpin", "invite",
+                       "welcome", "goodbye"):
+                await msg.reply_text("Group management features are only available in the main bot.")
+                return
+
+        if is_group_chat(update) and is_main:
+            async def get_target_user():
+                if msg.reply_to_message:
+                    return msg.reply_to_message.from_user.id
+                elif args and args[0].startswith("@"):
+                    return await resolve_user_id(context, args[0])
+                return None
+
+            if cmd == "welcome":
+                chat_data = get_chat_data(data, chat_id)
+                if not args:
+                    await msg.reply_text("Usage: /welcome <message> or /welcome off")
+                    return
+                if args[0].lower() == "off":
+                    chat_data["welcome_enabled"] = False
+                    await save_data(data, token)
+                    await msg.reply_text("Welcome message disabled.")
+                else:
+                    message = " ".join(args)
+                    chat_data["welcome_text"] = message
+                    chat_data["welcome_enabled"] = True
+                    await save_data(data, token)
+                    await msg.reply_text(f"Welcome message set to:\n{message}")
+                return
+
+            elif cmd == "goodbye":
+                chat_data = get_chat_data(data, chat_id)
+                if not args:
+                    await msg.reply_text("Usage: /goodbye <message> or /goodbye off")
+                    return
+                if args[0].lower() == "off":
+                    chat_data["goodbye_enabled"] = False
+                    await save_data(data, token)
+                    await msg.reply_text("Goodbye message disabled.")
+                else:
+                    message = " ".join(args)
+                    chat_data["goodbye_text"] = message
+                    chat_data["goodbye_enabled"] = True
+                    await save_data(data, token)
+                    await msg.reply_text(f"Goodbye message set to:\n{message}")
+                return
+
+            elif cmd == "mute":
+                target = await get_target_user()
+                if not target:
+                    await msg.reply_text("Reply to a user or use /mute @username")
+                    return
+                try:
+                    perms = ChatPermissions(can_send_messages=False)
+                    await context.bot.restrict_chat_member(chat_id, target, perms)
+                    await msg.reply_text(f"🔇 Muted user {target}")
+                except Exception as e:
+                    await msg.reply_text(f"❌ Failed: {e}")
+                return
+
+            elif cmd == "unmute":
+                target = await get_target_user()
+                if not target:
+                    await msg.reply_text("Reply to a user or use /unmute @username")
+                    return
+                try:
+                    perms = ChatPermissions(
+                        can_send_messages=True,
+                        can_send_media_messages=True,
+                        can_send_polls=True,
+                        can_send_other_messages=True,
+                        can_add_web_page_previews=True,
+                        can_change_info=False,
+                        can_invite_users=True,
+                        can_pin_messages=False
+                    )
+                    await context.bot.restrict_chat_member(chat_id, target, perms)
+                    await msg.reply_text(f"🔊 Unmuted user {target}")
+                except Exception as e:
+                    await msg.reply_text(f"❌ Failed: {e}")
+                return
+
+            elif cmd == "kick":
+                target = await get_target_user()
+                if not target:
+                    await msg.reply_text("Reply to a user or use /kick @username")
+                    return
+                try:
+                    await context.bot.ban_chat_member(chat_id, target)
+                    await asyncio.sleep(0.5)
+                    await context.bot.unban_chat_member(chat_id, target)
+                    await msg.reply_text(f"👢 Kicked user {target}")
+                except Exception as e:
+                    await msg.reply_text(f"❌ Failed: {e}")
+                return
+
+            elif cmd == "ban":
+                target = await get_target_user()
+                if not target:
+                    await msg.reply_text("Reply to a user or use /ban @username")
+                    return
+                try:
+                    await context.bot.ban_chat_member(chat_id, target)
+                    await msg.reply_text(f"🚫 Banned user {target}")
+                except Exception as e:
+                    await msg.reply_text(f"❌ Failed: {e}")
+                return
+
+            elif cmd == "unban":
+                target = None
+                if msg.reply_to_message:
+                    target = msg.reply_to_message.from_user.id
+                elif args and args[0].isdigit():
+                    target = int(args[0])
+                elif args and args[0].startswith("@"):
+                    target = await resolve_user_id(context, args[0])
+                if not target:
+                    await msg.reply_text("Reply to a user, provide ID, or use @username")
+                    return
+                try:
+                    await context.bot.unban_chat_member(chat_id, target)
+                    await msg.reply_text(f"✅ Unbanned user {target}")
+                except Exception as e:
+                    await msg.reply_text(f"❌ Failed: {e}")
+                return
+
+            elif cmd == "promote":
+                target = await get_target_user()
+                if not target:
+                    await msg.reply_text("Reply to a user or use /promote @username")
+                    return
+                title = " ".join(args[1:]) if len(args) > 1 else None
+                try:
+                    await context.bot.promote_chat_member(
+                        chat_id, target,
+                        can_change_info=True,
+                        can_delete_messages=True,
+                        can_invite_users=True,
+                        can_restrict_members=True,
+                        can_pin_messages=True,
+                        can_promote_members=False
+                    )
+                    if title:
+                        await context.bot.set_chat_administrator_custom_title(chat_id, target, title)
+                    await msg.reply_text(f"⭐ Promoted user {target}" + (f" with title: {title}" if title else ""))
+                except Exception as e:
+                    await msg.reply_text(f"❌ Failed: {e}")
+                return
+
+            elif cmd == "demote":
+                target = await get_target_user()
+                if not target:
+                    await msg.reply_text("Reply to a user or use /demote @username")
+                    return
+                try:
+                    await context.bot.promote_chat_member(
+                        chat_id, target,
+                        can_change_info=False,
+                        can_delete_messages=False,
+                        can_invite_users=False,
+                        can_restrict_members=False,
+                        can_pin_messages=False,
+                        can_promote_members=False
+                    )
+                    await msg.reply_text(f"👤 Demoted user {target}")
+                except Exception as e:
+                    await msg.reply_text(f"❌ Failed: {e}")
+                return
+
+            elif cmd == "title":
+                target = await get_target_user()
+                if not target:
+                    await msg.reply_text("Reply to a user or use /title @username <text>")
+                    return
+                title = " ".join(args[1:]) if len(args) > 1 else ""
+                try:
+                    await context.bot.set_chat_administrator_custom_title(chat_id, target, title)
+                    await msg.reply_text(f"🏷️ Admin title for {target} set to: {title}")
+                except Exception as e:
+                    await msg.reply_text(f"❌ Failed: {e}")
+                return
+
+            elif cmd == "setgrouptitle":
+                if not args:
+                    await msg.reply_text("Usage: /setgrouptitle <new title>")
+                    return
+                new_title = " ".join(args)
+                try:
+                    await context.bot.set_chat_title(chat_id, new_title)
+                    await msg.reply_text(f"✅ Group title changed to: {new_title}")
+                except Exception as e:
+                    await msg.reply_text(f"❌ Failed: {e}")
+                return
+
+            elif cmd == "setgroupdesc":
+                if not args:
+                    await msg.reply_text("Usage: /setgroupdesc <description>")
+                    return
+                desc = " ".join(args)
+                try:
+                    await context.bot.set_chat_description(chat_id, desc)
+                    await msg.reply_text("✅ Group description updated.")
+                except Exception as e:
+                    await msg.reply_text(f"❌ Failed: {e}")
+                return
+
+            elif cmd == "setgroupphoto":
+                if not msg.reply_to_message or not msg.reply_to_message.photo:
+                    await msg.reply_text("Reply to a photo with /setgroupphoto")
+                    return
+                photo = msg.reply_to_message.photo[-1].file_id
+                try:
+                    await context.bot.set_chat_photo(chat_id, photo)
+                    await msg.reply_text("✅ Group photo updated.")
+                except Exception as e:
+                    await msg.reply_text(f"❌ Failed: {e}")
+                return
+
+            elif cmd == "delete":
+                if not msg.reply_to_message:
+                    await msg.reply_text("Reply to a message to delete it.")
+                    return
+                try:
+                    await context.bot.delete_message(chat_id, msg.reply_to_message.message_id)
+                    await msg.delete()  # also delete the command message
+                except Exception as e:
+                    await msg.reply_text(f"❌ Failed: {e}")
+                return
+
+            elif cmd == "pin":
+                if not msg.reply_to_message:
+                    await msg.reply_text("Reply to a message to pin it.")
+                    return
+                try:
+                    await context.bot.pin_chat_message(chat_id, msg.reply_to_message.message_id)
+                    await msg.reply_text("📌 Message pinned.")
+                except Exception as e:
+                    await msg.reply_text(f"❌ Failed: {e}")
+                return
+
+            elif cmd == "unpin":
+                if args and args[0].lower() == "all":
+                    try:
+                        await context.bot.unpin_all_chat_messages(chat_id)
+                        await msg.reply_text("✅ All messages unpinned.")
+                    except Exception as e:
+                        await msg.reply_text(f"❌ Failed: {e}")
+                elif msg.reply_to_message:
+                    try:
+                        await context.bot.unpin_chat_message(chat_id, msg.reply_to_message.message_id)
+                        await msg.reply_text("✅ Message unpinned.")
+                    except Exception as e:
+                        await msg.reply_text(f"❌ Failed: {e}")
+                else:
+                    await msg.reply_text("Reply to a message or use /unpin all")
+                return
+
+            elif cmd == "invite":
+                try:
+                    invite = await context.bot.create_chat_invite_link(chat_id)
+                    await msg.reply_text(f"🔗 Invite link: {invite.invite_link}")
+                except Exception as e:
+                    await msg.reply_text(f"❌ Failed: {e}")
+                return
+
+        # ---------- AI CHAT COMMANDS ----------
+        if cmd == "chat":
+            if not args:
+                await msg.reply_text(f"Usage: {prefix}chat <message>")
+                return
+            user_msg = " ".join(args)
+            await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+            reply = await chat_with_ai(context, data, token, chat_id, user_msg)
+            if len(reply) > 4000:
+                for i in range(0, len(reply), 4000):
+                    await safe_send(context, chat_id, reply[i:i+4000])
+            else:
+                await safe_send(context, chat_id, reply)
+            return
+
+        elif cmd == "resetai":
+            conv_key = str(chat_id)
+            if conv_key in data.get("conversations", {}):
+                del data["conversations"][conv_key]
+                await save_data(data, token)
+            await msg.reply_text("Conversation history cleared.")
+            return
+
+        elif cmd == "systemprompt":
+            if not args:
+                await msg.reply_text(f"Current system prompt: {data.get('system_prompt')}")
+                return
+            prompt = " ".join(args)
+            data["system_prompt"] = prompt
+            await save_data(data, token)
+            conv_key = str(chat_id)
+            if conv_key in data.get("conversations", {}):
+                del data["conversations"][conv_key]
+            await msg.reply_text(f"System prompt updated and conversation reset.")
+            return
+
+        elif cmd == "aistatus":
+            key_stat = "✅ Set" if data.get("api_key") else "❌ Not set"
+            model = data.get("ai_model", "gpt-3.5-turbo")
+            url = data.get("api_url", "https://api.openai.com/v1")
+            prompt = data.get("system_prompt", "Not set")
+            status_text = (
+                f"**AI Status**\n"
+                f"API Key: {key_stat}\n"
+                f"API URL: `{url}`\n"
+                f"Model: `{model}`\n"
+                f"System prompt: `{prompt}`"
+            )
+            await msg.reply_text(status_text, parse_mode="Markdown")
+            return
+
+        # Unknown command – ignore
+        return
+
+    # ---------- AUTO‑REACT & AUTO‑REPLY (for non‑command messages) ----------
+    if update.message:
+        chat_id = update.message.chat.id
+        user_id = update.message.from_user.id if update.message.from_user else None
+        if user_id is None:
+            return
+
+        chat_data = data["chats"].get(str(chat_id))
+        if chat_data:
+            auto_replies = chat_data.get("auto_replies", {})
+            if str(user_id) in auto_replies:
+                reply_text = auto_replies[str(user_id)]
+                await safe_send(context, chat_id, reply_text,
+                                reply_to_message_id=update.message.message_id)
+
+            user_reacts = chat_data.get("user_reacts", [])
+            if user_id in user_reacts:
+                emoji = chat_data.get("react_emoji", "❤️")
+                await safe_react(context, chat_id, update.message.message_id, emoji)
+                return
+
+            if chat_data.get("global_react", False):
+                emoji = chat_data.get("react_emoji", "❤️")
+                await safe_react(context, chat_id, update.message.message_id, emoji)
+
+# ---------- BOT STARTUP ----------
+
+def run_bot(token: str, is_clone: bool = False):
+    global restart_requested
+    data = asyncio.run(load_data(token))
+    app = Application.builder().token(token).build()
+    app.bot_data["persistent_data"] = data
+    app.bot_data["bot_token"] = token
+    app.bot_data["is_clone"] = is_clone
+
+    async def post_init(app: Application):
+        # aiohttp session must be created inside the running event loop
+        app.bot_data["http_session"] = aiohttp.ClientSession()
+
+        try:
+            await asyncio.wait_for(app.bot.set_my_name(BOT_ORIGINAL_NAME), timeout=20)
+        except Exception as e:
+            logger.error(f"Could not set name: {e}")
+
+        try:
+            msg_text = "Clone bot ready! Owner R☉LEX SIR" if is_clone else "Full ready hai bot owner ka name R☉LEX SIR hai"
+            await app.bot.send_message(chat_id=OWNER_ID, text=msg_text)
+        except Exception as e:
+            logger.error(f"Owner DM failed: {e}")
+
+    async def post_shutdown(app: Application):
+        session = app.bot_data.get("http_session")
+        if session and not session.closed:
+            await session.close()
+            logger.info("HTTP session closed.")
+
+    app.post_init = post_init
+    app.post_shutdown = post_shutdown
+
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member), group=1)
+    app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, goodbye_member), group=1)
+    app.add_handler(MessageHandler(filters.ALL, handle_all), group=0)
+
+    logger.info(f"Bot starting with token ...{token[-6:]} (clone={is_clone})")
+    app.run_polling(close_loop=False)
+
+    # After polling stops (normal or due to restart)
+    if restart_requested:
+        logger.info("Restarting bot...")
+        script_path = sys.argv[0] if sys.argv[0].endswith(".py") else "relex_bot.py"
+        args_list = [sys.executable, script_path]
+        if is_clone:
+            args_list.append(token)
+        subprocess.Popen(args_list)
+        sys.exit(0)
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        clone_token = sys.argv[1]
+        asyncio.run(run_bot(clone_token, is_clone=True))
+    else:
+        if DEFAULT_TOKEN == "YOUR_MAIN_BOT_TOKEN_HERE":
+            print("Please set your main bot token in DEFAULT_TOKEN variable.")
+            sys.exit(1)
+        asyncio.run(run_bot(DEFAULT_TOKEN, is_clone=False))
